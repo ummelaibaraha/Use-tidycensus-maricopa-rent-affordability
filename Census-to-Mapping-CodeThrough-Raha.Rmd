@@ -1,0 +1,386 @@
+---
+title: "From Census Tables to Maps: A tidycensus Code-Through"
+author: "Umme Laiba Raha"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: readable
+    df_print: paged
+    highlight: tango
+    toc: yes
+    toc_float: yes
+---
+
+```{r include = FALSE}
+
+# SET GLOBAL KNITR OPTIONS
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      message = FALSE, 
+                      warning = FALSE, 
+                      fig.width = 10, 
+                      fig.height = 8)
+
+
+
+# LOAD PACKAGES
+
+library(pander)
+library(kableExtra)
+
+```
+
+<br>
+<br>
+
+# Introduction
+
+This code-through explores how to pull American Community Survey (ACS) data directly into R with the `tidycensus` package, and how to turn those tables into maps. Our running example asks: **where in Maricopa County, Arizona, do renters spend the largest share of income on rent?**
+
+<br>
+
+## Content Overview
+
+Specifically, I'll explain and demonstrate how to:
+
+* connect R to the Census API
+* find ACS variable codes
+* download tract-level data and boundaries in a single step
+* create a new variable and map it with `sf` and `ggplot2`
+
+<br>
+
+## Why You Should Care
+
+Census data are the backbone of housing, transportation, and neighborhood analysis. Downloading tables by hand and joining them to boundary files is slow and hard to reproduce. With `tidycensus`, the whole workflow lives in one script that anyone can re-run, which makes it easy to share with teammates or update when new data are released.
+
+<br>
+
+## Learning Objectives
+
+Specifically, you will learn how to:
+
+1. Install a Census API key and use `get_acs()`
+2. Search for variables with `load_variables()`
+3. Read the estimate and margin-of-error columns
+4. Build and map a derived variable
+5. Flag unreliable estimates and scale the same code to other geographies
+
+<br>
+<br>
+
+# Using tidycensus
+
+Here, I'll show a complete workflow, starting with setup and ending with a map and some more advanced extensions.
+
+<br>
+
+## Further Exposition
+
+`tidycensus` was created by Kyle Walker and Matt Herman. It wraps the Census Bureau's APIs and uses the `tigris` package to fetch matching boundary files. The ACS is a survey, so every estimate comes with a **margin of error (MOE)**. Keeping track of the MOE is one of the most important habits when working with this data.
+
+Three ideas are worth knowing before the examples:
+
+* **ACS 5-year estimates** pool survey responses over five years (here, 2018-2022). This gives more reliable numbers for small areas such as census tracts, but the values describe an average over the period, not a single year.
+* **Census tracts** are small statistical areas of roughly 1,200 to 8,000 people. They are a common unit for neighborhood-level housing analysis.
+* **The 30% rule** is a widely used housing-affordability benchmark: housing is considered affordable when it costs no more than 30% of household income. We use it in the Advanced Examples to classify tracts.
+
+You will need a free API key from <https://api.census.gov/data/key_signup.html>. Run this **once** on your own computer, then restart R. Do not paste your key into a file you plan to share.
+
+```{r api-key, eval = FALSE}
+census_api_key("YOUR_KEY_HERE", install = TRUE)
+```
+
+<br>
+
+## Basic Example
+
+### Step 1: Load packages
+
+```{r packages}
+
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(viridis)
+
+options(tigris_use_cache = TRUE)  # cache boundary files so re-knitting is fast
+
+```
+
+### Step 2: Find variables
+
+ACS tables use codes like `B25064_001`. Use `load_variables()` to search by keyword.
+
+```{r find-vars}
+
+acs_vars <- load_variables(2022, "acs5")
+
+acs_vars %>%
+  filter(str_detect(label, regex("median gross rent$", ignore_case = TRUE)))
+
+```
+
+I will use two variables:
+
+```{r var-table}
+
+data.frame(
+  Code = c("B25064_001", "B19013_001"),
+  Meaning = c("Median gross rent (monthly, dollars)",
+              "Median household income (past 12 months, dollars)")
+) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+
+```
+
+### Step 3: Download the data
+
+Naming the variables makes the output easier to read. `output = "wide"` gives one row per tract, and `geometry = TRUE` brings the tract polygons along.
+
+```{r get-acs, results = "hide"}
+
+maricopa_raw <- get_acs(
+  geography = "tract",
+  variables = c(rent = "B25064_001",
+                income = "B19013_001"),
+  state = "AZ",
+  county = "Maricopa",
+  year = 2022,
+  survey = "acs5",
+  output = "wide",
+  geometry = TRUE
+)
+
+```
+
+**Before:** the raw data.
+
+```{r glimpse-before}
+
+glimpse(maricopa_raw)
+
+```
+
+What to notice:
+
+* `rentE` and `incomeE` are the **estimates**
+* `rentM` and `incomeM` are the **margins of error**
+* `geometry` holds the polygons, which makes this an `sf` data frame
+
+### Step 4: Clean and create a variable
+
+I drop tracts with missing values and calculate the share of annual income that goes to rent.
+
+```{r wrangle}
+
+maricopa <- maricopa_raw %>%
+  filter(!is.na(rentE), !is.na(incomeE), incomeE > 0) %>%
+  mutate(rent_share = (rentE * 12) / incomeE) %>%
+  select(GEOID, NAME, rentE, rentM, incomeE, rent_share)
+
+```
+Filtering removes 58 of the 1,009 tracts that have no rent or income estimate. These tracts (for example, airports, parks, and industrial or sparsely populated areas) have too few survey responses, so they appear as blank areas on the maps.
+
+**After:** only the columns we need, plus the new variable.
+
+```{r glimpse-after}
+
+glimpse(maricopa)
+
+```
+
+### Step 5: Map it
+
+Because the data are already an `sf` object, `geom_sf()` draws it directly.
+
+```{r basic-map}
+
+ggplot(maricopa) +
+  geom_sf(aes(fill = rent_share), color = NA) +
+  scale_fill_viridis_c(
+    option = "magma",
+    direction = -1,
+    labels = scales::percent_format(accuracy = 1),
+    name = "Rent as share\nof income",
+    limits = c(0, 0.6),
+    oob = scales::squish
+  ) +
+  labs(
+    title = "Median Rent Relative to Median Income",
+    subtitle = "Census tracts, Maricopa County, AZ",
+    caption = "Source: ACS 5-year estimates (2018-2022), via tidycensus"
+  ) +
+  theme_void(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"))
+
+```
+
+A few tips for readable choropleths:
+
+* `color = NA` removes tract borders that clutter large maps
+* `limits` with `oob = scales::squish` keeps a few extreme tracts from washing out the color scale
+* `theme_void()` removes axes that mean little on a map
+
+<br>
+
+## Advanced Examples
+
+### Finding affordable tracts
+
+A common rule of thumb says housing is **affordable** when it takes no more than 30% of income. We can flag tracts that meet that standard and summarize them. Note that this compares *median* rent to *median* income, so it is a tract-level screening measure and not the share of renter households that can afford their rent.
+
+
+```{r affordable-table}
+
+affordability <- maricopa %>%
+  mutate(affordable = if_else(rent_share <= 0.30,
+                              "Affordable (30% or less)",
+                              "Not affordable (over 30%)"))
+
+affordability %>%
+  st_drop_geometry() %>%
+  count(affordable) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  kable(col.names = c("Rent share of income", "Tracts", "Percent")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+
+```{r affordable-map}
+ggplot(affordability) +
+  geom_sf(aes(fill = affordable), color = NA) +
+  scale_fill_manual(values = c("Affordable (30% or less)" = "#2c7fb8",
+                               "Not affordable (over 30%)" = "#d95f0e"),
+                    name = "Rent share\nof income") +
+  labs(title = "Affordable vs. Not Affordable Tracts",
+       subtitle = "Census tracts, Maricopa County, AZ",
+       caption = "Source: ACS 5-year estimates (2018-2022), via tidycensus") +
+  theme_void(base_size = 13)
+```
+
+White areas on the map are tracts with no rent or income estimate, not errors.
+
+To test a different standard, change the `0.30` in `if_else()` and the labels to match.
+
+<br>
+
+### Checking reliability with the margin of error
+
+Small tracts can have noisy estimates. A standard check is the **coefficient of variation (CV)**: the standard error divided by the estimate. The Census Bureau publishes MOEs at the 90% confidence level, so the standard error is the MOE divided by 1.645.
+
+```{r reliability}
+
+reliability <- maricopa %>%
+  mutate(rent_cv = (rentM / 1.645) / rentE,
+         reliability = case_when(
+           rent_cv < 0.12 ~ "High",
+           rent_cv < 0.40 ~ "Medium",
+           TRUE ~ "Low"
+         ))
+
+reliability %>%
+  st_drop_geometry() %>%
+  count(reliability) %>%
+  kable(col.names = c("Reliability of rent estimate", "Tracts")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+```
+
+The cutoffs above (12% and 40%) are widely used rules of thumb, not official Census rules. Pick thresholds that fit your own project.
+
+<br>
+
+### Scaling up: counties across Arizona
+
+The same code works for other geographies. Change `geography` to `"county"` and drop the `county` argument to get every county in the state.
+
+```{r counties, results = "hide"}
+
+az_counties <- get_acs(
+  geography = "county",
+  variables = c(rent = "B25064_001",
+                income = "B19013_001"),
+  state = "AZ",
+  year = 2022,
+  survey = "acs5",
+  output = "wide",
+  geometry = TRUE
+) %>%
+  mutate(rent_share = (rentE * 12) / incomeE)
+
+```
+
+```{r counties-map}
+
+ggplot(az_counties) +
+  geom_sf(aes(fill = rent_share), color = "white") +
+  scale_fill_viridis_c(option = "magma", direction = -1,
+                       labels = scales::percent_format(accuracy = 1),
+                       name = "Rent as share\nof income") +
+  labs(title = "Median Rent Relative to Median Income",
+       subtitle = "Arizona counties",
+       caption = "Source: ACS 5-year estimates (2018-2022), via tidycensus") +
+  theme_void(base_size = 13)
+
+```
+
+<br>
+
+### Common problems
+
+```{r problems-table}
+
+data.frame(
+  Problem = c("A Census API key is required",
+              "Slow knitting",
+              "Many NA values",
+              "Map looks distorted"),
+  Cause = c("Key not installed",
+            "Boundaries re-download each time",
+            "Tracts with too few survey responses",
+            "Mixed coordinate systems"),
+  Fix = c("Run census_api_key() and restart R",
+          "Set options(tigris_use_cache = TRUE)",
+          "Filter them out and check the MOE columns",
+          "Use st_transform() so all layers share one CRS")
+) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+
+```
+
+<br> 
+<br>
+
+# Further Resources
+
+Learn more about `tidycensus` and mapping Census data with the following:
+
+<br>
+
+* Resource I [tidycensus package documentation](https://walker-data.com/tidycensus/): Official guide to all tidycensus functions, with examples.
+
+* Resource II [Analyzing US Census Data: Methods, Maps, and Models in R](https://walker-data.com/census-r/): Free online book covering Census data, mapping, and modeling in R.
+
+* Resource III [sf package documentation](https://r-spatial.github.io/sf/): Reference for working with spatial data in R.
+
+<br>
+<br>
+
+# Works Cited
+
+This code-through references and cites the following sources:
+
+<br>
+
+* Walker, K. & Herman, M. (n.d.). tidycensus package documentation. [walker-data.com/tidycensus](https://walker-data.com/tidycensus/)
+
+* Walker, K. (2023). Analyzing US Census Data: Methods, Maps, and Models in R. [walker-data.com/census-r](https://walker-data.com/census-r/)
+
+* U.S. Census Bureau (n.d.). American Community Survey 5-Year Estimates (2018-2022). [census.gov/programs-surveys/acs](https://www.census.gov/programs-surveys/acs)
+
+<br>
+<br>
